@@ -1834,6 +1834,23 @@ function installTool(a, state, tx) {
     ((prev && prev.dropins) || []).filter(function (d) {
         return !(c.dropins || []).some(function (x) { return x.unit === d.unit && x.name === d.name; }) && lstatOrNull(dropinPath(d));
     }).forEach(function (d) { ops.push({ type: 'delete', path: dropinPath(d) }); unitChanged = true; });
+    /* a unit the version it replaces had and this one has not: stopped, then
+     * deleted with its enablement (a rollback puts it back and starts it) */
+    var dropped = ((prev && prev.units) || []).map(function (u) { return u.name; }).filter(function (name) {
+        return !(c.units || []).some(function (u) { return u.name === name; }) && lstatOrNull(path.join(CFG.systemd, name));
+    });
+    tx.stopped = [];
+    ((prev && prev.enable) || []).forEach(function (en) {
+        var link = path.join(CFG.systemd, en.target + '.wants', en.unit);
+        if (dropped.indexOf(en.unit) >= 0 && lstatOrNull(link)) ops.push({ type: 'delete', path: link });
+    });
+    dropped.forEach(function (name) {
+        if (unitState(name, 'is-active') === 'active') {
+            if (systemctl(['stop', name]).status === 0) tx.stopped.push(name);
+            else warn('could not stop ' + name);
+        }
+        ops.push({ type: 'delete', path: path.join(CFG.systemd, name) }); unitChanged = true;
+    });
     i7.units.forEach(function (u) { ops.push({ type: 'delete', path: path.join(CFG.systemd, u) }); unitChanged = true; });
     var rec = recmgrOp(recmgrWith(recmgrText(), c.recmgr || [], []));
     if (rec) { ops.push(rec); unitChanged = true; }
@@ -1842,6 +1859,8 @@ function installTool(a, state, tx) {
     if (ops.length) rootfsWindow(ops);
     crashListDone(crash, remounts);
     if (unitChanged) runOk(CFG.systemctl, ['daemon-reload']);
+    if (dropped.length) say('removed ' + dropped.join(', ') + ': ' + c.id + ' ' + c.version + ' does not have ' +
+        (dropped.length > 1 ? 'them' : 'it'));
     if (i7.paths.length) {
         i7.files.forEach(function (f) { rmrf(path.join(I7_DIR, f)); });
         try { fs.rmdirSync(I7_DIR); } catch (e) { /* not empty, or gone */ }
@@ -1905,7 +1924,8 @@ function postInstall(c, root) {
  * reported as such. Otherwise current returns to the previous version,
  * the snapshot puts units and the recmgr list back, a version folder this
  * install created goes, a socket it started whose unit is gone again is
- * stopped, and units it restarted restart on the previous version. */
+ * stopped, a unit it stopped because the version had it no more starts
+ * again, and units it restarted restart on the previous version. */
 function rollbackTool(a, tx, backup, e, state) {
     var c = a.component;
     if ((e.health || e.privacy) && !tx.before) {
@@ -1936,6 +1956,10 @@ function rollbackTool(a, tx, backup, e, state) {
         }
     });
     runOk(CFG.systemctl, ['daemon-reload']);
+    (tx.stopped || []).forEach(function (u) {
+        if (systemctl(['start', u]).status === 0) say('started ' + u + ' again');
+        else warn('could not start ' + u + ' again');
+    });
     pruneCreatedDirs(state);
     if (e.health) restartAgain(e.health, c.id + ' ' + tx.before);
     if (e.privacy) {
@@ -4255,9 +4279,13 @@ function cmdStatus(args, crashList, live) {
 }
 function artifactTouched(a) {
     if (a.kind === 'tool') {
-        /* the installed version's drop-ins too: an update that drops one removes it */
+        /* the installed version's units, enablement and drop-ins too: an
+         * update that drops one removes it */
         var installed = installedTools().filter(function (t) { return t.id === a.id; })[0];
-        var gone = ((installed && installed.component.dropins) || []).map(dropinPath);
+        var was = (installed && installed.component) || {};
+        var gone = (was.dropins || []).map(dropinPath)
+            .concat((was.units || []).map(function (u) { return path.join(CFG.systemd, u.name); }))
+            .concat((was.enable || []).map(function (en) { return path.join(CFG.systemd, en.target + '.wants', en.unit); }));
         return toolTouched(a.component).concat(gone).concat(i7Takeover(a).paths)
             .concat([path.join(CFG.varOpt, a.id, 'versions', a.version)]).concat(uplinkDropIns(a.id));
     }
