@@ -710,6 +710,9 @@ function testBounceGuard() {
         !r.out.includes('waiting') && Date.now() - n0 < MIN * 1000 && none.kills().length === 0, r.out);
 }
 
+function lstatOrNull(p) {
+    try { return fs.lstatSync(p); } catch (e) { return null; }
+}
 function readJsonOrNull(p) {
     try {
         return readJson(p);
@@ -1844,7 +1847,7 @@ function testRollback() {
         root.status().pending_reboot.some((x) => x.id === 'fixture-tool'), r.out);
     check('rollback: unit lists that differ are warned about, unit files unchanged',
         r.out.includes('unit files stay as 0.3.0 installed them') &&
-        fs.existsSync(root.p('etc/systemd/system/fixture-tool.socket')), r.out);
+        !fs.existsSync(root.p('etc/systemd/system/fixture-tool.socket')), r.out);
 
     root.run(['install', '--artifact', appArtifact('fixture_app', '1.0.0', true), '--yes']);
     r = root.run(['rollback', 'fixture_app', '--yes']);
@@ -3917,6 +3920,48 @@ function testDropins() {
     check('dropins: ...and after its removal the unit\'s folder is as before', root.hash(skip).hash === h2.hash, treeDiff(h2, root.hash(skip)));
 }
 
+function testDroppedUnits() {
+    // 0.1.0 has the socket and the service; 0.3.0 and 0.4.0 the service only
+    const tool = (version, withSocket) => {
+        const out = fs.mkdtempSync(path.join(T, 'art-'));
+        const r = hu(['artifact', fixtureCopy(version, (c) => {
+            if (!withSocket) {
+                c.units = c.units.filter((u) => u.name !== 'fixture-tool.socket');
+                c.enable = [];
+            }
+        }), '--out', out]);
+        if (r.status !== 0) {
+            throw new Error(`deploy/hu artifact failed: ${r.stderr}`);
+        }
+        return path.join(out, `fixture-tool@${version}.tgz`);
+    };
+    const root = fakeRoot({ recmgr: ['fixture-tool'] });
+    const socket = root.p('etc/systemd/system/fixture-tool.socket');
+    const link = root.p('etc/systemd/system/sockets.target.wants/fixture-tool.socket');
+    const first = root.run(['install', '--artifact', tool('0.1.0', true), '--yes']);
+    const listening = fs.existsSync(socket) && !!fs.readlinkSync(link) &&
+        root.systemctlCalls().includes('start fixture-tool.socket');
+
+    // an update that drops the socket and fails its health check puts it back, listening
+    write(root.unitFile('fixture-tool.service.active'), 'active');
+    write(root.unitFile('fixture-tool.service.crash'), `${root.p('var/opt/fixture-tool/current')} versions/0.4.0`);
+    const bad = root.run(['install', '--artifact', tool('0.4.0', false), '--yes']);
+    fs.unlinkSync(root.unitFile('fixture-tool.service.crash'));
+    check('dropped units: a failed update without the socket is rolled back with it, started again',
+        first.status === 0 && listening && bad.status === 1 && fs.existsSync(socket) &&
+        fs.readlinkSync(link) === '../fixture-tool.socket' &&
+        root.systemctlCalls().lastIndexOf('start fixture-tool.socket') > root.systemctlCalls().lastIndexOf('stop fixture-tool.socket') &&
+        fs.readlinkSync(root.p('var/opt/fixture-tool/current')) === 'versions/0.1.0', `${first.out}\n${bad.out}`);
+
+    // an update whose version has no socket stops it and removes it with its enablement
+    const r = root.run(['install', '--artifact', tool('0.3.0', false), '--yes']);
+    const calls = root.systemctlCalls();
+    check('dropped units: an update without the socket stops it and removes it with its enablement',
+        r.status === 0 && !fs.existsSync(socket) && !lstatOrNull(link) && fs.existsSync(root.p('etc/systemd/system/fixture-tool.service')) &&
+        calls.lastIndexOf('stop fixture-tool.socket') > calls.lastIndexOf('start fixture-tool.socket') &&
+        r.out.includes('removed fixture-tool.socket'), r.out);
+}
+
 /* idrive7-apps' own installer (deploy/mgu-app-install.sh there) left its
  * renderer and controller gate: a tool of ours takes them over. */
 function i7Leftovers(root) {
@@ -4913,6 +4958,7 @@ const SUITES = [
     testServices,
     testProvides,
     testDropins,
+    testDroppedUnits,
     testI7Takeover,
     testKeepRunning,
     testPostInstall,
